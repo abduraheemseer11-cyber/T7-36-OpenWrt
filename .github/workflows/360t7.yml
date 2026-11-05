@@ -1,0 +1,167 @@
+#
+# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+# https://github.com/P3TERX/Actions-OpenWrt
+# Description: Build OpenWrt using GitHub Actions
+#
+
+name: AbduRaheem-OpenWrt-360T7
+
+on:
+  workflow_dispatch:
+    inputs:
+      manual:
+        description: 'Run a manual build'
+  schedule:
+    - cron: 0 16 * * 5
+
+permissions:
+  actions: write
+  contents: write
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-25.12
+  BUILD_ENV_SCRIPT_COMMIT: 04a39ca00d2cd6895c84e1c0670bc719cbd8d9fb
+  BUILD_ENV_SCRIPT_SHA256: 85f4b2c2aa16f8178b57250f5d2bcf4a2e0707c6b569a3b07510f41fc6185dd8
+  CONFIG_FILE: main.config
+  DIY_P2_SH: diy2.sh
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Riyadh
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        persist-credentials: false
+
+    - name: Init build environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        curl --fail --show-error --silent --location \
+          "https://raw.githubusercontent.com/immortalwrt/build-scripts/$BUILD_ENV_SCRIPT_COMMIT/init_build_environment.sh" \
+          --output /tmp/init_build_environment.sh
+        echo "$BUILD_ENV_SCRIPT_SHA256  /tmp/init_build_environment.sh" | sha256sum --check -
+        sudo bash /tmp/init_build_environment.sh
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+        echo "FIRMWARE_VERSION=$(date +"%y%m%d")" >> $GITHUB_ENV
+        echo "START_DATE=$(date +'%Y-%m-%d %H:%M%S秒')" >> $GITHUB_ENV
+
+    - name: Clone source
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        UPSTREAM_COMMIT=$(git -C openwrt rev-parse HEAD)
+        echo "UPSTREAM_COMMIT=$UPSTREAM_COMMIT" >> "$GITHUB_ENV"
+        echo "ImmortalWrt commit: $UPSTREAM_COMMIT"
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom config
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        cat extra.config >> openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Download packages
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Organize firmware
+      id: organize
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        # Clean up firmware files
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        rm -rf version.buildinfo
+        rm -rf profiles.json
+        rm -rf *rootfs*
+        rm -rf *kernel*
+        rm -rf *.manifest
+        rm -rf sha256sums
+        mv *sysupgrade.itb ${{ env.FIRMWARE_VERSION }}-AbduRaheem-OpenWrt-360T7-sysupgrade.itb
+        mv *initramfs-recovery.itb ${{ env.FIRMWARE_VERSION }}-AbduRaheem-OpenWrt-360T7-recovery.itb
+        mv *preloader.bin ${{ env.FIRMWARE_VERSION }}-AbduRaheem-OpenWrt-360T7-preloader.bin
+        mv *bl31-uboot.fip ${{ env.FIRMWARE_VERSION }}-AbduRaheem-OpenWrt-360T7-bl31-uboot.fip
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware artifact
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: ${{ env.FIRMWARE_VERSION }}-AbduRaheem-OpenWrt-360T7
+        path: ${{ env.FIRMWARE }}
+
+    - name: Create release tag
+      id: tag
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        release_tag="${{ env.FIRMWARE_VERSION }}-AbduRaheem-OpenWrt-360T7"
+        echo "Build time: $(date +'%Y-%m-%d %H:%M')" >> release.txt
+        echo "ImmortalWrt commit: $UPSTREAM_COMMIT" >> release.txt
+        echo "Default IP: 192.168.1.20 (DHCP and IPv6 disabled)" >> release.txt
+        echo "Default plugins: $(sed 's/#.*//;/=n/d;s/CONFIG_PACKAGE_\(.*\)=y/\1/' extra.config | tr '\n' ' ')" >> release.txt
+        echo "release_tag=$release_tag" >> $GITHUB_OUTPUT
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload to release
+      uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        name: ${{ env.FIRMWARE_VERSION }}-AbduRaheem-OpenWrt-360T7
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@0cf693bc9909e5e867ee8f27b813224ba862939c # v2
+      with:
+        retain_days: 1
+        keep_minimum_runs: 3
+
+    - name: Delete old releases
+      uses: dev-drprasad/delete-older-releases@0bf4e6748f08135170c2294f877ba7d9b633b028 # v0.3.3
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

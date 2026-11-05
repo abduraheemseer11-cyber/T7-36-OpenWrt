@@ -1,0 +1,101 @@
+#!/bin/sh
+# AbduRaheem OpenWrt - first boot defaults (runs once, then deleted)
+
+# ---------------- Editable settings ----------------
+LAN_IP="192.168.1.20"
+LAN_MASK="255.255.255.0"
+HOSTNAME="AbduRaheem-OpenWrt"
+SSID_ID=""            # number shown between ( ) ; leave empty to omit
+COUNTRY="US"          # regulatory domain (affects allowed channels/power)
+# ---------------------------------------------------
+
+if [ -n "$SSID_ID" ]; then
+	SSID_BASE="AL-AMEER-NET ($SSID_ID)"
+else
+	SSID_BASE="AL-AMEER-NET"
+fi
+
+# ---- System / LuCI: English default ----
+uci set system.@system[0].hostname="$HOSTNAME"
+uci set luci.main.lang='en'
+uci commit system
+uci commit luci
+
+# ---- LAN IP ----
+uci set network.lan.proto='static'
+uci set network.lan.ipaddr="$LAN_IP"
+uci set network.lan.netmask="$LAN_MASK"
+
+# ---- Disable IPv6 ----
+uci -q delete network.lan.ip6assign
+uci -q delete network.lan.ip6hint
+uci -q delete network.wan6
+uci -q delete network.globals.ula_prefix
+uci -q set network.lan.delegate='0'
+uci commit network
+
+# ---- Disable DHCP (v4 + v6 server) ----
+uci set dhcp.lan.ignore='1'
+uci -q delete dhcp.lan.start
+uci -q delete dhcp.lan.limit
+uci -q delete dhcp.lan.leasetime
+uci set dhcp.lan.dhcpv6='disabled'
+uci set dhcp.lan.ra='disabled'
+uci set dhcp.lan.ndp='disabled'
+uci -q delete dhcp.lan.ra_slaac
+uci -q delete dhcp.lan.ra_flags
+uci -q set dhcp.wan.ignore='1'
+uci -q set dhcp.@dnsmasq[0].filter_aaaa='1'
+uci -q set dhcp.odhcpd.maindhcp='0'
+uci commit dhcp
+/etc/init.d/odhcpd disable 2>/dev/null
+
+# ---- Wi-Fi ----
+[ -n "$(uci -q show wireless | grep '=wifi-device')" ] || wifi config
+[ -n "$(uci -q show wireless | grep '=wifi-device')" ] || exit 1   # retry on next boot
+
+for radio in $(uci -q show wireless | sed -n "s/^wireless\.\([^.=]*\)=wifi-device$/\1/p"); do
+	band="$(uci -q get wireless.$radio.band)"
+	if [ -z "$band" ]; then
+		case "$(uci -q get wireless.$radio.hwmode)" in
+			11a) band="5g" ;;
+			*)   band="2g" ;;
+		esac
+	fi
+
+	# remove all existing interfaces on this radio
+	for s in $(uci -q show wireless | sed -n "s/^wireless\.\([^.=]*\)=wifi-iface$/\1/p"); do
+		[ "$(uci -q get wireless.$s.device)" = "$radio" ] && uci -q delete wireless.$s
+	done
+
+	uci set wireless.$radio.country="$COUNTRY"
+	uci set wireless.$radio.disabled='0'
+
+	case "$band" in
+	2g)
+		uci set wireless.$radio.channel='4'
+		uci set wireless.$radio.htmode='HE20'
+		uci set wireless.$radio.txpower='30'
+		SSID="${SSID_BASE}_2G"; WDS='0'
+		;;
+	5g)
+		uci set wireless.$radio.channel='116'
+		uci set wireless.$radio.htmode='HE40'
+		uci set wireless.$radio.txpower='28'
+		SSID="${SSID_BASE}_5G"; WDS='1'
+		;;
+	*) continue ;;
+	esac
+
+	uci set wireless.default_$radio='wifi-iface'
+	uci set wireless.default_$radio.device="$radio"
+	uci set wireless.default_$radio.network='lan'
+	uci set wireless.default_$radio.mode='ap'
+	uci set wireless.default_$radio.ssid="$SSID"
+	uci set wireless.default_$radio.encryption='none'
+	uci set wireless.default_$radio.disabled='0'
+	[ "$WDS" = "1" ] && uci set wireless.default_$radio.wds='1'
+done
+uci commit wireless
+
+exit 0
